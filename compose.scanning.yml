@@ -1,0 +1,52 @@
+# Add to the default Compose deployment for fail-closed malware scanning.
+x-scanner-env: &scanner-env
+  CLAMAV_HOST: clamav
+  CLAMAV_PORT: 3310
+  CLAMAV_REQUIRED: "true"
+
+services:
+  clamav:
+    image: clamav/clamav:1.4
+    networks: [private, edge]
+    restart: unless-stopped
+    mem_limit: 4g
+    cpus: 2.0
+    environment:
+      CLAMD_CONF_StreamMaxLength: 256M
+      CLAMD_CONF_MaxFileSize: 256M
+      CLAMD_CONF_MaxScanSize: 512M
+    volumes:
+      - clamav-signatures:/var/lib/clamav
+    healthcheck:
+      test: ["CMD", "clamdcheck.sh"]
+      interval: 15s
+      timeout: 5s
+      retries: 20
+      start_period: 45s
+
+  api:
+    environment: *scanner-env
+    depends_on:
+      clamav:
+        condition: service_healthy
+
+  worker:
+    environment: *scanner-env
+    depends_on:
+      clamav:
+        condition: service_healthy
+
+  benchmark-worker:
+    environment: *scanner-env
+    depends_on:
+      clamav:
+        condition: service_healthy
+
+  beat:
+    environment: *scanner-env
+
+  migrate:
+    environment: *scanner-env
+
+volumes:
+  clamav-signatures:

@@ -1,0 +1,50 @@
+# Optional single-node, S3-compatible storage for local Compose deployments.
+x-s3-env: &s3-env
+  STORAGE_BACKEND: s3
+  S3_ENDPOINT_URL: http://objects:8333
+  S3_BUCKET: ${S3_BUCKET:-pdf-pro}
+  S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:?Set S3_ACCESS_KEY_ID}
+  S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:?Set S3_SECRET_ACCESS_KEY}
+
+services:
+  objects:
+    image: chrislusf/seaweedfs:4.50
+    command: ["mini", "-dir=/data"]
+    networks: [private]
+    restart: unless-stopped
+    environment:
+      AWS_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:?Set S3_ACCESS_KEY_ID}
+      AWS_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:?Set S3_SECRET_ACCESS_KEY}
+      S3_BUCKET: ${S3_BUCKET:-pdf-pro}
+    volumes:
+      - object-data:/data
+    mem_limit: 768m
+    healthcheck:
+      test: ["CMD-SHELL", "nc -z localhost 8333"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+
+  api:
+    environment: *s3-env
+    depends_on:
+      objects:
+        condition: service_healthy
+
+  worker:
+    environment: *s3-env
+    depends_on:
+      objects:
+        condition: service_healthy
+
+  benchmark-worker:
+    environment: *s3-env
+    depends_on:
+      objects:
+        condition: service_healthy
+
+  beat:
+    environment: *s3-env
+
+volumes:
+  object-data:

@@ -1,0 +1,209 @@
+name: pdf-word-pro
+
+x-backend-env: &backend-env
+  ENVIRONMENT: ${ENVIRONMENT:-development}
+  DATABASE_URL: postgresql+psycopg://pdfpro:${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}@postgres:5432/pdfpro
+  REDIS_URL: redis://redis:6379/0
+  SECRET_KEY: ${SECRET_KEY:?Set SECRET_KEY in .env}
+  STORAGE_DIR: /var/lib/pdf-pro
+  WORK_DIR: /tmp/pdf-pro-work
+  STORAGE_BACKEND: ${STORAGE_BACKEND:-local}
+  S3_BUCKET: ${S3_BUCKET:-pdf-pro}
+  S3_ENDPOINT_URL: ${S3_ENDPOINT_URL:-}
+  S3_REGION: ${S3_REGION:-us-east-1}
+  S3_ACCESS_KEY_ID: ${S3_ACCESS_KEY_ID:-}
+  S3_SECRET_ACCESS_KEY: ${S3_SECRET_ACCESS_KEY:-}
+  CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:3000,http://127.0.0.1:3000}
+  COOKIE_SECURE: ${COOKIE_SECURE:-false}
+  CLAMAV_HOST: ${CLAMAV_HOST:-}
+  CLAMAV_PORT: ${CLAMAV_PORT:-3310}
+  CLAMAV_REQUIRED: ${CLAMAV_REQUIRED:-false}
+  MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-50}
+  MAX_OUTPUT_MB: ${MAX_OUTPUT_MB:-256}
+  DAILY_CONVERSION_LIMIT: ${DAILY_CONVERSION_LIMIT:-40}
+  METADATA_RETENTION_DAYS: ${METADATA_RETENTION_DAYS:-30}
+  MAX_PAGES: ${MAX_PAGES:-500}
+  MAX_BATCH_FILES: ${MAX_BATCH_FILES:-10}
+  RETENTION_MINUTES: ${RETENTION_MINUTES:-60}
+  OCR_LANGUAGES: ${OCR_LANGUAGES:-eng,urd,ara}
+  JOB_TIMEOUT_SECONDS: ${JOB_TIMEOUT_SECONDS:-300}
+  BENCHMARK_ARTIFACT_DAYS: ${BENCHMARK_ARTIFACT_DAYS:-14}
+  BENCHMARK_APPLICATION_VERSION: ${BENCHMARK_APPLICATION_VERSION:-1.0.0+bench.1}
+
+x-backend-common: &backend-common
+  environment: *backend-env
+  networks: [private]
+  init: true
+  read_only: true
+  cap_drop: [ALL]
+  security_opt: [no-new-privileges:true]
+  volumes:
+    - documents:/var/lib/pdf-pro
+  tmpfs:
+    - /tmp:rw,nosuid,nodev,mode=1777,size=1073741824
+
+x-api-image: &api-image
+  image: pdf-word-pro-api:local
+  build:
+    context: .
+    dockerfile: backend/Dockerfile
+    target: api
+
+services:
+  postgres:
+    image: postgres:17-alpine
+    restart: unless-stopped
+    networks: [private]
+    environment:
+      POSTGRES_DB: pdfpro
+      POSTGRES_USER: pdfpro
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?Set POSTGRES_PASSWORD in .env}
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U pdfpro -d pdfpro"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  redis:
+    image: redis:8.4-alpine
+    restart: unless-stopped
+    networks: [private]
+    command: ["redis-server", "--appendonly", "yes", "--maxmemory", "384mb", "--maxmemory-policy", "noeviction"]
+    volumes:
+      - redis-data:/data
+    mem_limit: 700m
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  migrate:
+    <<: [*backend-common, *api-image]
+    command: ["alembic", "upgrade", "head"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    <<: [*backend-common, *api-image]
+    restart: unless-stopped
+    environment:
+      <<: *backend-env
+      ADMIN_EMAIL: ${ADMIN_EMAIL:-}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:-}
+    mem_limit: 768m
+    cpus: 1.5
+    pids_limit: 128
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/api/v1/health', timeout=3).close()"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+  worker:
+    <<: *backend-common
+    image: pdf-word-pro-worker:local
+    build:
+      context: .
+      dockerfile: backend/Dockerfile
+      target: worker
+    restart: unless-stopped
+    command: ["celery", "-A", "app.workers.celery_app:celery_app", "worker", "--loglevel=INFO", "-Q", "pdfpro", "--concurrency=${WORKER_CONCURRENCY:-1}"]
+    cpus: 2.0
+    mem_limit: 3g
+    pids_limit: 256
+    stop_grace_period: 6m
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A app.workers.celery_app:celery_app inspect -d celery@$$HOSTNAME ping --timeout=4 | grep -q pong"]
+      interval: 30s
+      timeout: 8s
+      retries: 4
+      start_period: 15s
+
+  benchmark-worker:
+    <<: *backend-common
+    image: pdf-word-pro-worker:local
+    restart: unless-stopped
+    command: ["celery", "-A", "app.workers.celery_app:celery_app", "worker", "--loglevel=INFO", "-Q", "pdfpro.benchmark", "--concurrency=${BENCHMARK_CONCURRENCY:-2}", "--max-tasks-per-child=16"]
+    cpus: 2.0
+    mem_limit: 3g
+    pids_limit: 256
+    stop_grace_period: 5m
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "celery -A app.workers.celery_app:celery_app inspect -d celery@$$HOSTNAME ping --timeout=4 | grep -q pong"]
+      interval: 30s
+      timeout: 8s
+      retries: 4
+      start_period: 15s
+
+  beat:
+    <<: [*backend-common, *api-image]
+    restart: unless-stopped
+    command: ["celery", "-A", "app.workers.celery_app:celery_app", "beat", "--loglevel=INFO", "--schedule=/tmp/celerybeat", "--pidfile=/tmp/celerybeat.pid"]
+    mem_limit: 256m
+    cpus: 0.5
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "test -s /tmp/celerybeat.pid && kill -0 $$(cat /tmp/celerybeat.pid)"]
+      interval: 15s
+      timeout: 3s
+      retries: 5
+
+  frontend:
+    image: pdf-word-pro-frontend:local
+    build:
+      context: ./frontend
+      args:
+        SITE_URL: ${SITE_URL:-http://localhost:3000}
+    restart: unless-stopped
+    init: true
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    networks: [edge, private]
+    environment:
+      API_INTERNAL_URL: http://api:8000
+      SITE_URL: ${SITE_URL:-http://localhost:3000}
+    ports:
+      - "${FRONTEND_BIND:-127.0.0.1}:${FRONTEND_PORT:-3000}:3000"
+    mem_limit: 768m
+    cpus: 1.5
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "node", "-e", "fetch('http://127.0.0.1:3000/', {signal: AbortSignal.timeout(4000)}).then(r=>{if(!r.ok)process.exit(1)}).catch(()=>process.exit(1))"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+
+networks:
+  private:
+    internal: true
+  edge:
+
+volumes:
+  postgres-data:
+  redis-data:
+  documents:
